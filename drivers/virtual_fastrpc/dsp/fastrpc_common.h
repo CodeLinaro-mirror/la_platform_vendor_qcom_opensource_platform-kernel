@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  *
- * Copyright (c) 2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2023-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #ifndef __FASTRPC_COMMON_H__
@@ -69,6 +69,11 @@
 #define FASTRPC_STATIC_HANDLE_KERNEL	1
 #define FASTRPC_STATIC_HANDLE_LISTENER	3
 #define FASTRPC_STATIC_HANDLE_MAX	20
+
+/* Max value of unique fastrpc tgid. The value range
+ * is 1 - 255, so 255 PDs can be opened at the same
+ * time as maximum if hardware resource is enough. */
+#define MAX_FRPC_TGID 256
 
 #define PERF_END ((void)0)
 
@@ -278,6 +283,12 @@ struct virt_fastrpc_sgl {
 	u64 len;	/* buffer length */
 };
 
+struct virt_fastrpc_sgtable {
+	u32 nents;
+	struct virt_fastrpc_sgl sgl[0];
+} __packed;
+
+
 struct virt_cap_msg {
 	struct virt_msg_hdr hdr;	/* virtio fastrpc message header */
 	u32 domain;		/* DSP domain id */
@@ -346,8 +357,11 @@ struct vfastrpc_apps {
 	struct virt_fastrpc_msg *msgtable[FASTRPC_MSG_MAX];
 	uint32_t max_sess_per_proc;
 	spinlock_t hlock;
+	struct hlist_head drivers;
 };
 
+int get_unique_hlos_process_id(struct vfastrpc_file *vfl);
+void put_unique_hlos_process_id(struct vfastrpc_file *vfl);
 int virt_fastrpc_close(struct vfastrpc_file *vfl);
 void vfastrpc_queue_completed_async_job(struct vfastrpc_invoke_ctx *ctx);
 void virt_free_msg(struct vfastrpc_file *vfl, struct virt_fastrpc_msg *msg);
