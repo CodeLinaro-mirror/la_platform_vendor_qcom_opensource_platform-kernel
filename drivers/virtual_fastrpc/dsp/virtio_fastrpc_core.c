@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/ion.h>
@@ -17,9 +17,6 @@
 #define SIZE_OF_MAPPING(nents) \
 	(sizeof(struct virt_fastrpc_mapping) + \
 		nents * sizeof(struct virt_fastrpc_sgl))
-
-/* Max value of unique fastrpc tgid */
-#define MAX_FRPC_TGID 65
 
 enum virtio_fastrpc_invoke_attr {
 	/* bit0, 1: FE/BE crc enabled, 0: FE/BE crc disabled */
@@ -42,20 +39,12 @@ FASTRPC_MAX_DSP_ATTRIBUTES] = {
 	PERF_CAPABILITY_SUPPORT	/* PERF_LOGGING_V2_SUPPORT feature is supported, unsupported = 0 */
 };
 
-/* Array to keep track unique tgid_frpc usage */
-static bool frpc_tgid_usage_array[MAX_FRPC_TGID] = {0};
-
 struct virt_fastrpc_cmd {
 	struct hlist_node hn;
 	struct virt_fastrpc_msg *msg;
 	u32 tid;	/* thread id */
 	u32 cmd;	/* cmd type */
 };
-
-struct virt_fastrpc_sgtable {
-	u32 nents;
-	struct virt_fastrpc_sgl sgl[0];
-} __packed;
 
 struct virt_fastrpc_mapping {
 	s32 fd;
@@ -405,9 +394,6 @@ int vfastrpc_file_free(struct vfastrpc_file *vfl)
 	spin_lock_irqsave(&fl->aqlock, flags);
 	atomic_add(1, &fl->async_queue_job_count);
 	wake_up_interruptible(&fl->async_wait_queue);
-	/* Reset the tgid usage to false */
-	if (fl->tgid_frpc != -1)
-		frpc_tgid_usage_array[fl->tgid_frpc] = false;
 	spin_unlock_irqrestore(&fl->aqlock, flags);
 
 	vfastrpc_context_list_dtor(vfl);
@@ -427,6 +413,8 @@ int vfastrpc_file_free(struct vfastrpc_file *vfl)
 		vfastrpc_mmap_free(vfl, lmap, 1);
 	} while (lmap);
 	mutex_unlock(&fl->map_mutex);
+
+	put_unique_hlos_process_id(vfl);
 
 	mutex_destroy(&fl->map_mutex);
 	mutex_destroy(&fl->internal_map_mutex);
@@ -777,7 +765,7 @@ static int get_args(struct vfastrpc_invoke_ctx *ctx)
 			vmmap->fd = maps[i]->fd;
 			vmmap->refcount = maps[i]->refs;
 			vmmap->va = maps[i]->va;
-			vmmap->len = maps[i]->size;
+			vmmap->len = maps[i]->len;
 			vmmap->attr = VFASTRPC_MAP_ATTR_CACHED;
 
 			if ((maps[i]->attr & VFASTRPC_MAP_ATTR_BUFFER_MAPPED)) {
@@ -1626,6 +1614,8 @@ static int vfastrpc_internal_mmap(struct vfastrpc_file *vfl,
 		vfastrpc_mmap_free(vfl, map, 0);
 		mutex_unlock(&fl->map_mutex);
 	}
+	if (err && rbuf)
+		vfastrpc_buf_free(rbuf, 0);
 	mutex_unlock(&fl->internal_map_mutex);
 	return err;
 }
@@ -1770,7 +1760,7 @@ static int vfastrpc_internal_mem_map(struct vfastrpc_file *vfl,
 	vmmap.fd = map->fd;
 	vmmap.refcount = map->refs;
 	vmmap.va = map->va;
-	vmmap.len = map->size;
+	vmmap.len = map->len;
 	vmmap.attr = VFASTRPC_MAP_ATTR_CACHED;
 	vmmap.nents = map->table->nents;
 	err = virt_fastrpc_mem_map(vfl, ud->m.offset, ud->m.flags, ud->m.attrs,
@@ -1793,7 +1783,7 @@ bail:
 	return err;
 }
 
-static int virt_fastrpc_mem_unmap(struct vfastrpc_file *vfl, int fd, u64 size,
+static int virt_fastrpc_mem_unmap(struct vfastrpc_file *vfl, int fd, u64 len,
 		uintptr_t raddr)
 {
 	struct fastrpc_file *fl = to_fastrpc_file(vfl);
@@ -1815,7 +1805,7 @@ static int virt_fastrpc_mem_unmap(struct vfastrpc_file *vfl, int fd, u64 size,
 	vmsg->hdr.msgid = msg->msgid;
 	vmsg->hdr.result = 0xffffffff;
 	vmsg->fd = fd;
-	vmsg->len = size;
+	vmsg->len = len;
 	vmsg->raddr = raddr;
 
 	err = vfastrpc_txbuf_send(vfl, vmsg, sizeof(*vmsg));
@@ -1869,7 +1859,7 @@ static int vfastrpc_internal_mem_unmap(struct vfastrpc_file *vfl,
 		goto bail;
 	}
 
-	err = virt_fastrpc_mem_unmap(vfl, map->fd, map->size, map->raddr);
+	err = virt_fastrpc_mem_unmap(vfl, map->fd, map->len, map->raddr);
 	if (err)
 		goto bail;
 
@@ -1969,25 +1959,6 @@ static int vfastrpc_internal_control(struct vfastrpc_file *vfl,
 	}
 bail:
 	return err;
-}
-
-// Generate a unique process ID to DSP process
-static int get_unique_hlos_process_id(struct vfastrpc_file *vfl)
-{
-	int tgid_frpc = -1, tgid_index = 1;
-	struct vfastrpc_apps *me = vfl->apps;
-
-	spin_lock(&me->hlock);
-	for (tgid_index = 1; tgid_index < MAX_FRPC_TGID; tgid_index++) {
-		if (!frpc_tgid_usage_array[tgid_index]) {
-			tgid_frpc = tgid_index;
-			/* Set the tgid usage to false */
-			frpc_tgid_usage_array[tgid_index] = true;
-			break;
-		}
-	}
-	spin_unlock(&me->hlock);
-	return tgid_frpc;
 }
 
 static int vfastrpc_set_process_info(struct vfastrpc_file *vfl)
