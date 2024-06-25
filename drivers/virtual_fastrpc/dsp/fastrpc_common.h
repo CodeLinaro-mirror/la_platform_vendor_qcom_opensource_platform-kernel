@@ -28,8 +28,6 @@
 #define PID_SIZE			10
 #define FASTRPC_MSG_MAX			256
 
-#define CDSP1_DOMAIN_ID			4
-
 /* fastRPC DSP firmware capability */
 #define UNSIGNED_PD_SUPPORT		1
 
@@ -306,6 +304,7 @@ struct vfastrpc_channel_ctx {
 	uint64_t sesscount;
 	uint64_t ssrcount;
 	int in_hib;
+	void *handle;
 	uint64_t prevssrcount;
 	struct notifier_block nb;
 	int subsystemstate;

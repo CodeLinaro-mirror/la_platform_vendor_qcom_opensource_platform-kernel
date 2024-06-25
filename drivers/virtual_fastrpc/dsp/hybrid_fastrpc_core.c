@@ -1503,7 +1503,6 @@ struct vfastrpc_file *hfastrpc_file_alloc(const struct vfastrpc_operations *ops)
 	fl->init_mem = NULL;
 	fl->qos_request = 0;
 	fl->dsp_proc_init = 0;
-	fl->is_ramdump_pend = false;
 	fl->dsp_process_state = PROCESS_CREATE_DEFAULT;
 	fl->is_unsigned_pd = false;
 	fl->is_compat = false;
@@ -2078,8 +2077,6 @@ static int hfastrpc_invoke_send(struct vfastrpc_invoke_ctx *ctx,
 		goto bail;
 	}
 
-	channel_ctx = &vfl->apps->channel[domain];
-	mutex_lock(&channel_ctx->smd_mutex);
 	msg->pid = vfl->upid;
 	msg->tid = current->pid;
 	if (fl->sessionid)
@@ -2091,6 +2088,9 @@ static int hfastrpc_invoke_send(struct vfastrpc_invoke_ctx *ctx,
 	msg->invoke.header.sc = sc;
 	msg->invoke.page.addr = ctx->buf ? ctx->buf->da : 0;
 	msg->invoke.page.size = buf_page_size(ctx->used);
+
+	channel_ctx = &vfl->apps->channel[domain];
+	mutex_lock(&channel_ctx->smd_mutex);
 
 	if (fl->ssrcount != channel_ctx->ssrcount) {
 		err = -ECONNRESET;
@@ -2429,9 +2429,12 @@ int hfastrpc_internal_invoke(struct vfastrpc_file *vfl, uint32_t mode,
 		}
 		context_free(ctx);
 	}
-	if (domain >= 0 && domain < vfl->apps->num_channels
-		&& (fl->ssrcount != vfl->apps->channel[domain].ssrcount))
-		err = -ECONNRESET;
+	if (domain >= 0 && domain < vfl->apps->num_channels) {
+		mutex_lock(&(vfl->apps->channel[domain].smd_mutex));
+		if (fl->ssrcount != vfl->apps->channel[domain].ssrcount)
+			err = -ECONNRESET;
+		mutex_unlock(&(vfl->apps->channel[domain].smd_mutex));
+	}
 
 invoke_end:
 	if (fl->profile && !interrupted && isasyncinvoke)
@@ -2689,10 +2692,10 @@ static int hfastrpc_dspsignal_signal(struct vfastrpc_file *vfl,
 		mutex_unlock(&channel_ctx->smd_mutex);
 		goto bail;
 	}
+	mutex_unlock(&channel_ctx->smd_mutex);
 
 	msg = (((uint64_t)vfl->upid) << 32) | ((uint64_t)sig->signal_id);
 	err = fastrpc_transport_send(domain, (void *)&msg, sizeof(msg), fl->tvm_remote_domain);
-	mutex_unlock(&channel_ctx->smd_mutex);
 
 bail:
 	return err;
@@ -2703,6 +2706,7 @@ static int hfastrpc_dspsignal_wait(struct vfastrpc_file *vfl,
 {
 	struct fastrpc_file *fl = to_fastrpc_file(vfl);
 	int err = 0;
+	uint32_t timeout_usec = wait->timeout_usec;
 	unsigned long timeout = usecs_to_jiffies(wait->timeout_usec);
 	uint32_t signal_id = wait->signal_id;
 	struct fastrpc_dspsignal *s = NULL;
@@ -2740,13 +2744,14 @@ static int hfastrpc_dspsignal_wait(struct vfastrpc_file *vfl,
 	}
 	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
 
-	if (timeout != 0xffffffff)
+	if (timeout_usec != 0xffffffff)
 		ret = wait_for_completion_interruptible_timeout(&s->comp, timeout);
 	else
 		ret = wait_for_completion_interruptible(&s->comp);
 
-	if (ret == 0) {
-		DSPSIGNAL_VERBOSE("Wait for signal %u timed out\n", signal_id);
+	if (timeout_usec != 0xffffffff && ret == 0) {
+		DSPSIGNAL_VERBOSE("Wait for signal %u timed out %ld us\n",
+				signal_id, timeout_usec);
 		err = -ETIMEDOUT;
 		goto bail;
 	} else if (ret < 0) {
