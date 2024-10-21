@@ -633,16 +633,21 @@ static int get_args(struct vfastrpc_invoke_ctx *ctx)
 			attrs[i] &= ~FASTRPC_ATTR_KEEP_MAP;
 			err = vfastrpc_mmap_create(vfl, fds[i], attrs[i],
 					0, 0, dmaflags, &maps[i]);
-			if (!err && maps[i])
-				maps[i]->ctx_refs++;
 			if (err) {
 				for (j = bufs; j < i; j++) {
-					if (maps[j] && maps[j]->ctx_refs)
-						maps[j]->ctx_refs--;
-					vfastrpc_mmap_free(vfl, maps[j], 0);
+					if (maps[j] && maps[j]->dma_handle_refs) {
+						maps[j]->dma_handle_refs--;
+						vfastrpc_mmap_free(vfl, maps[j], 0);
+					}
 				}
 				mutex_unlock(&fl->map_mutex);
 				goto bail;
+			} else if (maps[i]) {
+				/*
+				 * Increment  refs count for in/out handle if map created
+				 * and no error, indicate map under use in remote call
+				 */
+				maps[i]->dma_handle_refs++;
 			}
 			handlelen += SIZE_OF_MAPPING(maps[i]->table->nents);
 		}
@@ -964,9 +969,10 @@ static int put_args(struct vfastrpc_invoke_ctx *ctx)
 			break;
 		if (!vfastrpc_mmap_find(vfl, (int)fdlist[i], 0, 0,
 					0, 0, &mmap)) {
-			if (mmap && mmap->ctx_refs)
-				mmap->ctx_refs--;
-			vfastrpc_mmap_free(vfl, mmap, 0);
+			if (mmap && mmap->dma_handle_refs) {
+				mmap->dma_handle_refs = 0;
+				vfastrpc_mmap_free(vfl, mmap, 0);
+			}
 		}
 	}
 	mutex_unlock(&fl->map_mutex);
@@ -2146,7 +2152,14 @@ static int vfastrpc_internal_init_process(struct vfastrpc_file *vfl,
 	struct fastrpc_file *fl = to_fastrpc_file(vfl);
 	struct fastrpc_ioctl_init *init = &uproc->init;
 	int domain = vfl->domain;
-	struct vfastrpc_channel_ctx *chan = &vfl->apps->channel[domain];
+	struct vfastrpc_channel_ctx *chan = NULL;
+
+	if (domain < 0 || domain >= vfl->apps->num_channels) {
+		err = -ECHRNG;
+		goto bail;
+	}
+
+	chan = &vfl->apps->channel[domain];
 
 	if (chan->unsigned_support && fl->dev_minor == MINOR_NUM_DEV) {
 		/*
