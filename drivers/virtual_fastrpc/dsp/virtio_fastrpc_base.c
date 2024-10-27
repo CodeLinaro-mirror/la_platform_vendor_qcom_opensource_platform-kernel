@@ -106,6 +106,9 @@ static ssize_t vfastrpc_debugfs_read(struct file *filp, char __user *buffer,
 				"\n%s %d %s %d\n", "tgid_frpc =", fl->tgid_frpc,
 				"sessionid =", fl->sessionid);
 		len += scnprintf(fileinfo + len, DEBUGFS_SIZE - len,
+				"\n%s %d\n", "file_close =", fl->file_close);
+
+		len += scnprintf(fileinfo + len, DEBUGFS_SIZE - len,
 			"\n========%s %s %s========\n", title,
 			" LIST OF BUFS ", title);
 		spin_lock(&fl->hlock);
@@ -234,7 +237,7 @@ static const struct file_operations fops = {
 static int recv_single(struct virt_msg_hdr *rsp, unsigned int len)
 {
 	struct vfastrpc_apps *me = &gfa;
-	struct virt_fastrpc_msg *msg;
+	struct virt_fastrpc_msg *msg = NULL;
 
 	if (len != rsp->len) {
 		dev_err(me->dev, "msg %u len mismatch,expected %u but %d found\n",
@@ -243,23 +246,24 @@ static int recv_single(struct virt_msg_hdr *rsp, unsigned int len)
 	}
 	spin_lock(&me->msglock);
 	msg = me->msgtable[rsp->msgid];
-	spin_unlock(&me->msglock);
 
 	if (!msg) {
 		dev_err(me->dev, "msg %u already free in table[%u]\n",
 				rsp->cmd, rsp->msgid);
+		spin_unlock(&me->msglock);
 		return -EINVAL;
 	}
 	msg->rxbuf = (void *)rsp;
+
+	if (msg->ctx)
+		trace_recv_single_end(msg->ctx);
 
 	if (msg->ctx && msg->ctx->asyncjob.isasyncjob)
 		vfastrpc_queue_completed_async_job(msg->ctx);
 	else
 		complete(&msg->work);
 
-	if (msg->ctx)
-		trace_recv_single_end(msg->ctx);
-
+	spin_unlock(&me->msglock);
 	return 0;
 }
 
