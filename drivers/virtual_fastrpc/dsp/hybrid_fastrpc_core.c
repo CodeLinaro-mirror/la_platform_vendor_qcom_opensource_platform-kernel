@@ -946,6 +946,7 @@ static int hfastrpc_mem_map(struct vfastrpc_file *vfl,
 	}
 
 	/* create SMMU mapping */
+	mutex_lock(&fl->internal_map_mutex);
 	mutex_lock(&fl->map_mutex);
 	VERIFY(err, !(err = hfastrpc_mmap_create(vfl, ud->m.fd, ud->m.attrs,
 						ud->m.vaddrin, ud->m.length,
@@ -977,6 +978,7 @@ bail:
 			mutex_unlock(&fl->map_mutex);
 		}
 	}
+	mutex_unlock(&fl->internal_map_mutex);
 	return err;
 }
 
@@ -998,6 +1000,7 @@ static int hfastrpc_mem_unmap(struct vfastrpc_file *vfl,
 		goto bail;
 	}
 
+	mutex_lock(&fl->internal_map_mutex);
 	mutex_lock(&fl->map_mutex);
 	VERIFY(err, !(err = vfastrpc_mmap_remove(vfl, ud->um.fd,
 			(uintptr_t)ud->um.vaddr, ud->um.length, &map)));
@@ -1038,6 +1041,7 @@ bail:
 			mutex_unlock(&fl->map_mutex);
 		}
 	}
+	mutex_unlock(&fl->internal_map_mutex);
 	return err;
 }
 
