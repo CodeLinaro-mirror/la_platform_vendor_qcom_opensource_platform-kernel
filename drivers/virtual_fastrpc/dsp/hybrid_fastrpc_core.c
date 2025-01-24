@@ -476,7 +476,14 @@ static int hfastrpc_init_process(struct vfastrpc_file *vfl,
 	int domain = vfl->domain;
 	struct hlist_node *n = NULL;
 	unsigned long irq_flags = 0;
-	struct vfastrpc_channel_ctx *chan = &vfl->apps->channel[domain];
+	struct vfastrpc_channel_ctx *chan = NULL;
+
+	if (domain < 0 || domain >= vfl->apps->num_channels) {
+		err = -ECHRNG;
+		goto bail;
+	}
+
+	chan = &vfl->apps->channel[domain];
 
 	if (chan->unsigned_support && fl->dev_minor == MINOR_NUM_DEV) {
 		/*
@@ -939,6 +946,7 @@ static int hfastrpc_mem_map(struct vfastrpc_file *vfl,
 	}
 
 	/* create SMMU mapping */
+	mutex_lock(&fl->internal_map_mutex);
 	mutex_lock(&fl->map_mutex);
 	VERIFY(err, !(err = hfastrpc_mmap_create(vfl, ud->m.fd, ud->m.attrs,
 						ud->m.vaddrin, ud->m.length,
@@ -970,6 +978,7 @@ bail:
 			mutex_unlock(&fl->map_mutex);
 		}
 	}
+	mutex_unlock(&fl->internal_map_mutex);
 	return err;
 }
 
@@ -991,6 +1000,7 @@ static int hfastrpc_mem_unmap(struct vfastrpc_file *vfl,
 		goto bail;
 	}
 
+	mutex_lock(&fl->internal_map_mutex);
 	mutex_lock(&fl->map_mutex);
 	VERIFY(err, !(err = vfastrpc_mmap_remove(vfl, ud->um.fd,
 			(uintptr_t)ud->um.vaddr, ud->um.length, &map)));
@@ -1031,6 +1041,7 @@ bail:
 			mutex_unlock(&fl->map_mutex);
 		}
 	}
+	mutex_unlock(&fl->internal_map_mutex);
 	return err;
 }
 
@@ -1207,7 +1218,7 @@ static int context_alloc(struct vfastrpc_file *vfl, uint32_t kernel,
 	}
 
 	if (invokefd->fds) {
-		K_COPY_FROM_USER(err, kernel, ctx->fds, invokefd->fds,
+		K_COPY_FROM_USER(err, kernel_msg, ctx->fds, invokefd->fds,
 						bufs * sizeof(*ctx->fds));
 		if (err) {
 			ADSPRPC_ERR(
@@ -1220,7 +1231,7 @@ static int context_alloc(struct vfastrpc_file *vfl, uint32_t kernel,
 		ctx->fds = NULL;
 	}
 	if (invokefd->attrs) {
-		K_COPY_FROM_USER(err, kernel, ctx->attrs, invokefd->attrs,
+		K_COPY_FROM_USER(err, kernel_msg, ctx->attrs, invokefd->attrs,
 						bufs * sizeof(*ctx->attrs));
 		if (err) {
 			ADSPRPC_ERR(
@@ -1262,7 +1273,7 @@ static int context_alloc(struct vfastrpc_file *vfl, uint32_t kernel,
 		ctx->perf->tid = fl->tgid;
 	}
 	if (invokefd->job) {
-		K_COPY_FROM_USER(err, kernel, &ctx->asyncjob, invokefd->job,
+		K_COPY_FROM_USER(err, kernel_msg, &ctx->asyncjob, invokefd->job,
 						sizeof(ctx->asyncjob));
 		if (err)
 			goto bail;
