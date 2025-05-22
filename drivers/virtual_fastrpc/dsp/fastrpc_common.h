@@ -32,6 +32,9 @@
 #define FASTRPC_MAX_SESSIONS		14
 #define FASTRPC_MAX_SESSIONS_PER_PROCESS	4
 
+/* Check if given session id is valid */
+#define IS_VALID_SESSION_ID(sess) (sess < FASTRPC_MAX_SESSIONS_PER_PROCESS)
+
 #define FASTRPC_GLINK_GUID		"fastrpcglink-apps-dsp"
 
 #define FASTRPC_MSG_MAX			256
@@ -48,6 +51,7 @@
 #define VIRTIO_FASTRPC_CMD_MEM_UNMAP		10 /* used in legacy virtio fastrpc */
 #define VIRTIO_FASTRPC_CMD_SMMU_MAP		11
 #define VIRTIO_FASTRPC_CMD_SMMU_UNMAP		12
+#define VIRTIO_FASTRPC_CMD_MDCTX_MANAGE		13
 
 #define FASTRPC_CPUINFO_DEFAULT		0
 #define FASTRPC_CPUINFO_EARLY_WAKEUP	1
@@ -89,12 +93,21 @@
 #define USER_UNSIGNEDPD_POOL		9
 #define MAX_PD_TYPE			10
 
+#define SMMU_1M				0x100000ULL
+#define SMMU_2M				0x200000ULL
+#define SMMU_1G				0x40000000ULL
+/* Check if the given flag is used for extended UDMA mapping */
+#define IS_EXTENDED_MAP_FLAG(flag) \
+	(flag == FASTRPC_MAP_FD_EXTENDED || \
+	 flag == FASTRPC_MAP_FD_DELAYED_EXTENDED)
+
 /* set for cached mapping */
 #define FASTRPC_MAP_ATTR_CACHED		1
 
 /* set for multiple level SGT */
 #define FASTRPC_MAP_ATTR_MULTI_LEVEL_SGT	(1U << 1) /* 1: Multiple level sglist, 0: One level sglist */
-
+/* set for extended map */
+#define FASTRPC_MAP_ATTR_EXTENDED		(1U << 2) /* 1: uDMA64 on extended CB, 0: regular CB */
 /* Fastrpc attribute  for already mapped buffer */
 #define FASTRPC_MAP_ATTR_BUFFER_MAPPED (128)
 
@@ -385,6 +398,12 @@ struct fastrpc_user {
 	struct list_head interrupted;
 	struct list_head mmaps;
 	struct list_head cached_bufs;
+	/*
+	 * List of multidomain contexts created using this user,
+	 * only the first session of a multi-domain context will
+	 * book keep it.
+	 */
+	struct list_head mdctxs;
 
 	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_buf *pers_hdr_buf;
@@ -419,6 +438,30 @@ struct fastrpc_user {
 	bool untrusted_process;
 	bool set_session_info;
 	enum fastrpc_process_state state;
+};
+
+/*
+ * Struct to describe a multi-domain context, it could be either
+ * multi-core or multi-session.
+ */
+struct fastrpc_mdctx_info {
+	/* Node to add to process multidomain context list */
+	struct list_head node;
+	/* List of logcal domain ids  on which context was created */
+	uint32_t *domains;
+	/* List of session ids on each domain */
+	uint32_t *session_ids;
+	/*
+	 * List of channel id returned by virt_fastrpc_open,
+	 * which is composed of logical id and client id.
+	 */
+	int32_t *cids;
+	/* Number of domains */
+	uint32_t num_domains;
+	/* User-obj using which context was created */
+	struct fastrpc_user *fl;
+	/* Kernel generated context id */
+	uint64_t ctx;
 };
 
 struct virt_fastrpc_msg {
@@ -479,8 +522,10 @@ struct fastrpc_common {
 
 	spinlock_t msglock;
 	struct virt_fastrpc_msg *msgtable[FASTRPC_MSG_MAX];
-
-	/* global lock  to access channel context */
+	/*
+	 * use spin lock to protect global resources that are also accessed
+	 * in interrupt context
+	 */
 	spinlock_t glock;
 
 	/* Mutex to protect access of global domains hash tables */
@@ -491,6 +536,12 @@ struct fastrpc_common {
 	 * The hash table is used to efficiently manage and look up fastrpc domains.
 	 */
 	DECLARE_HASHTABLE(fastrpc_domains_table, FASTRPC_DEV_MAX);
+
+	/*
+	 * use mutex to protect global resources that will never be accessed
+	 * in interrupt context
+	 */
+	struct mutex gmut;
 
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debugfs_root;

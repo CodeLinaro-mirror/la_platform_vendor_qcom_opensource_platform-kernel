@@ -14,6 +14,7 @@
 #include <linux/uaccess.h>
 #include <linux/of.h>
 #include <linux/rpmsg.h>
+#include <linux/version.h>
 #include "fastrpc_common.h"
 
 /* Virtio ID of FASTRPC : 0xC005 */
@@ -85,7 +86,7 @@
  * need to be matched with BE_MINOR_VER. And it will return to 0 when
  * FE_MAJOR_VER is increased.
  */
-#define FE_MINOR_VER 0x6
+#define FE_MINOR_VER 0x7
 #define FE_VERSION (FE_MAJOR_VER << 16 | FE_MINOR_VER)
 #define BE_MAJOR_VER(ver) (((ver) >> 16) & 0xffff)
 
@@ -477,11 +478,20 @@ static void virt_init_vq(struct virt_fastrpc_vq *fastrpc_vq,
 static int init_vqs(struct fastrpc_common *gdriver)
 {
 	struct virtqueue *vqs[2];
+	int err, i;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+	struct virtqueue_info vqs_info[] = {
+		{"tx", NULL },
+		{"rx", fastrpc_vq_callback },
+	};
+
+	err = virtio_find_vqs(gdriver->vdev, 2, vqs, vqs_info, NULL);
+#else
 	static const char * const names[] = { "tx", "rx" };
 	vq_callback_t *cbs[] = { NULL, fastrpc_vq_callback };
-	int err, i;
 
 	err = virtio_find_vqs(gdriver->vdev, 2, vqs, cbs, names, NULL);
+#endif
 	if (err)
 		return err;
 
@@ -581,6 +591,7 @@ static int hfastrpc_probe(struct virtio_device *vdev)
 	memset(gdriver, 0, sizeof(*gdriver));
 	spin_lock_init(&gdriver->msglock);
 	spin_lock_init(&gdriver->glock);
+	mutex_init(&gdriver->gmut);
 
 	vdev->priv = gdriver;
 	gdriver->vdev = vdev;
@@ -657,7 +668,6 @@ static int hfastrpc_probe(struct virtio_device *vdev)
 		RPC_WARN("failed to create debugfs root dir\n");
 		debugfs_root = NULL;
 	}
-
 	gdriver->debugfs_root = debugfs_root;
 #endif
 
@@ -702,6 +712,7 @@ static void hfastrpc_remove(struct virtio_device *vdev)
 		kfree(g_domain_info);
 	}
 
+	mutex_destroy(&gdriver->gmut);
 	fastrpc_transport_deinit();
 	vdev->config->reset(vdev);
 	vdev->config->del_vqs(vdev);

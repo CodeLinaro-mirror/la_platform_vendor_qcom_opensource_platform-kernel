@@ -12,6 +12,8 @@ MSM_BOOT_MARKER := CONFIG_MSM_BOOT_MARKER=m
 QCOM_SUBSYS_STATUS := CONFIG_QCOM_SUBSYS_STATUS=m
 
 LOCAL_PATH := $(call my-dir)
+LOCAL_MODULE_DDK_BUILD := true
+LOCAL_MODULE_DDK_ALLOW_UNSAFE_HEADERS := true
 include $(CLEAR_VARS)
 
 # This makefile is only for DLKM
@@ -73,7 +75,7 @@ LOCAL_MODULE_DEBUG_ENABLE := true
 LOCAL_MODULE_PATH         := $(KERNEL_MODULES_OUT)
 
 ifneq ($(TARGET_BOARD_AUTO),true)
-LOCAL_REQUIRED_MODULES    +=boot_marker_select-module-symvers
+LOCAL_REQUIRED_MODULES    += boot_marker_select-module-symvers
 LOCAL_ADDITIONAL_DEPENDENCIES += $(call intermediates-dir-for,DLKM,boot_marker_select-module-symvers)/Module.symvers
 endif
 
@@ -218,7 +220,7 @@ endif
 
 # Drivers for LA-GVM only
 ###########################################################
-ifneq (,$(filter msmnile_gvmq gen4_gvm gen4_hgy gen5_gvm_gy, $(TARGET_BOARD_PLATFORM)$(TARGET_BOARD_SUFFIX)))
+ifneq (,$(filter msmnile_gvmq gen4_gvm gen4_hgy gen5_gvm_gy gen5_gvm, $(TARGET_BOARD_PLATFORM)$(TARGET_BOARD_SUFFIX)))
 KBUILD_OPTIONS += MODNAME=qcom-dt-socinfo
 KBUILD_OPTIONS += $(SOCINFO_DT_SELECT)
 
@@ -313,6 +315,17 @@ endif
 
 include $(DLKM_DIR)/Build_external_kernelmodule.mk
 endif
+
+###########################################################
+include $(CLEAR_VARS)
+# For incremental compilation
+LOCAL_SRC_FILES           := $(wildcard $(LOCAL_PATH)/**/*) $(wildcard $(LOCAL_PATH)/*)
+LOCAL_MODULE              := platform_kernel_select-module-symvers
+LOCAL_MODULE_STEM         := Module.symvers
+LOCAL_MODULE_KBUILD_NAME  := Module.symvers
+LOCAL_MODULE_PATH         := $(KERNEL_MODULES_OUT)
+
+include $(DLKM_DIR)/Build_external_kernelmodule.mk
 
 ###########################################################
 endif # DLKM check

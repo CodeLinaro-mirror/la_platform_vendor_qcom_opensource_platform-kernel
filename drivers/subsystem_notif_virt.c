@@ -19,6 +19,7 @@
 #include <linux/platform_device.h>
 #include <linux/interrupt.h>
 #include <linux/workqueue.h>
+#include <linux/version.h>
 #include "qcom_common.h"
 
 #define CLIENT_STATE_OFFSET 4
@@ -69,7 +70,6 @@ static void subsystem_notif_wq_func(struct work_struct *work)
 
 	state = readl_relaxed(base_reg + subsystem->offset);
 	subsystem_handle = qcom_ssr_get_subsys(subsystem->name);
-
 	/* Frontend qcom_ssr_notify_typ only supports 4 types with
 	 * different enum value.
 	 * Forward 0xFF to client for unknown types and forward return
@@ -92,10 +92,12 @@ static void subsystem_notif_wq_func(struct work_struct *work)
 			state = QCOM_SSR_TYPE_INVALID;
 			break;
 	}
-
-	ret = qcom_notify_ssr_clients(subsystem_handle, state, NULL);
-	writel_relaxed(ret, base_reg + subsystem->offset + CLIENT_STATE_OFFSET);
-	pr_debug("%s: receive %s interrupt with state: %d ret: %d\n", __func__, subsystem->name, state, ret);
+	if(subsystem_handle) {
+		ret = qcom_notify_ssr_clients(subsystem_handle, state, NULL);
+		writel_relaxed(ret, base_reg + subsystem->offset + CLIENT_STATE_OFFSET);
+		pr_debug("%s: receive %s interrupt with state: %d ret: %d\n", __func__,
+				subsystem->name, state, ret);
+	}
 }
 
 static int subsystem_state_callback(struct notifier_block *this,
@@ -246,12 +248,18 @@ static int subsys_notif_virt_probe(struct platform_device *pdev)
 	return ret;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6,10,0)
+static void subsys_notif_virt_remove(struct platform_device *pdev)
+#else
 static int subsys_notif_virt_remove(struct platform_device *pdev)
+#endif
 {
 	destroy_workqueue(ssr_wq);
 	release_resources();
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6,10,0)
 	return 0;
+#endif
 }
 
 static const struct of_device_id match_table[] = {
