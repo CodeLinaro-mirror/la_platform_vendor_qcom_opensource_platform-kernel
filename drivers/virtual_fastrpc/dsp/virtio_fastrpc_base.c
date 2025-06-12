@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2025, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 #include <linux/debugfs.h>
@@ -13,6 +13,7 @@
 #include <linux/virtio_config.h>
 #include <linux/uaccess.h>
 #include <linux/of.h>
+#include <linux/version.h>
 #include "virtio_fastrpc_core.h"
 #include "virtio_fastrpc_mem.h"
 #include "virtio_fastrpc_queue.h"
@@ -306,14 +307,42 @@ static void virt_init_vq(struct virt_fastrpc_vq *fastrpc_vq,
 	fastrpc_vq->vq = vq;
 }
 
+static void vfastrpc_unused_tx_bufs_list_free(struct vfastrpc_apps *me)
+{
+	struct vfastrpc_vqbuf *vtxbuf, *free;
+	struct hlist_node *n;
+
+	if (hlist_empty(&me->unused_tx_bufs))
+		return;
+	do {
+		free = NULL;
+		hlist_for_each_entry_safe(vtxbuf, n, &me->unused_tx_bufs, hn) {
+			free = vtxbuf;
+			hlist_del_init(&vtxbuf->hn);
+			break;
+		}
+		if (free)
+			kfree(free);
+	} while(free);
+}
+
 static int init_vqs(struct vfastrpc_apps *me)
 {
 	struct virtqueue *vqs[2];
+	int err, i;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 10, 0)
 	static const char * const names[] = { "output", "input" };
 	vq_callback_t *cbs[] = { NULL, recv_done };
-	int err, i;
 
 	err = virtio_find_vqs(me->vdev, 2, vqs, cbs, names, NULL);
+#else
+	struct virtqueue_info vqs_info[] = {
+		{ "output", NULL },
+		{ "input", recv_done },
+	};
+
+	err = virtio_find_vqs(me->vdev, 2, vqs, vqs_info, NULL);
+#endif
 	if (err)
 		return err;
 
@@ -359,14 +388,22 @@ static int init_vqs(struct vfastrpc_apps *me)
 			goto sbuf_del;
 		}
 	}
-	return 0;
 
+	INIT_HLIST_HEAD(&me->unused_tx_bufs);
+	for (i = 0; i < me->num_bufs; i++) {
+		err = put_a_tx_buf(me, me->sbufs[i]);
+		if (err) {
+			goto list_del;
+		}
+	}
+	return 0;
+list_del:
+	vfastrpc_unused_tx_bufs_list_free(me);
 sbuf_del:
 	for (i = 0; i < me->num_bufs; i++) {
 		if (me->sbufs[i])
 			free_pages((unsigned long)me->sbufs[i], me->order);
 	}
-
 rbuf_del:
 	for (i = 0; i < me->num_bufs; i++) {
 		if (me->rbufs[i])
@@ -525,8 +562,11 @@ static int virt_fastrpc_probe(struct virtio_device *vdev)
 	err = cdev_add(&me->cdev, MKDEV(MAJOR(me->dev_no), 0), NUM_DEVICES);
 	if (err)
 		goto cdev_init_bail;
-
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
+	me->class = class_create("fastrpc");
+#else
 	me->class = class_create(THIS_MODULE, "fastrpc");
+#endif
 	if (IS_ERR(me->class))
 		goto class_create_bail;
 
@@ -604,6 +644,8 @@ static void virt_fastrpc_remove(struct virtio_device *vdev)
 	vfastrpc_channel_deinit(me);
 	vdev->config->reset(vdev);
 	vdev->config->del_vqs(vdev);
+
+	vfastrpc_unused_tx_bufs_list_free(me);
 
 	for (i = 0; i < me->num_bufs; i++)
 		free_pages((unsigned long)me->rbufs[i], me->order);
