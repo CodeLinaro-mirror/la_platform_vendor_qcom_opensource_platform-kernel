@@ -20,9 +20,6 @@ ifneq ($(TARGET_USES_GY), true)
     PRODUCT_PACKAGES += subsystem_notif_virt.ko
     PRODUCT_PACKAGES += vm-cpufreq.ko
 endif
-ifeq ($(TARGET_HAS_VIRTIO_FASTRPC), true)
-    PRODUCT_PACKAGES += vfastrpc.ko
-endif
 ifeq ($(TARGET_HAS_HYBRID_FASTRPC), true)
     PRODUCT_PACKAGES += hfastrpc.ko
 endif
@@ -34,4 +31,7 @@ ifeq ($(call is-board-platform-in-list,sm6150), true)
 ifeq (,$(filter $(TARGET_BOARD_PLATFORM)$(TARGET_BOARD_SUFFIX), sm6150_gvmq))
     PRODUCT_PACKAGES += adsp_vote_smp2p.ko
 endif
+endif
+ifeq ($(TARGET_HAS_VIRTIO_FASTRPC), true)
+    PRODUCT_PACKAGES += vfastrpc.ko
 endif
