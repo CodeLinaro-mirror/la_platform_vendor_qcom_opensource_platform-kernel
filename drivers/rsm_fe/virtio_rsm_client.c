@@ -70,10 +70,16 @@ int rsm_register(rsm_handle* handle, unsigned int upid, unsigned int tid)
     struct virtio_rsm_txbuf *txbuf = NULL;
     int idx = 0;
     int err = NO_ERROR;
+
     if ((handle == NULL) || (upid == 0))
     {
-        LOG_RSMFE(LEVEL_ERR, " rsm_register unsuccessful. Invalid Args \n",err);
+        LOG_RSMFE(LEVEL_ERR, " rsm_register unsuccessful. Invalid Args \n");
         return -EINVAL;
+    }
+    if (g_vdevrsm == NULL)
+    {
+        LOG_RSMFE(LEVEL_ERR, "rsm_register unsuccessful. No device\n");
+        return -ENODEV;
     }
 
     /*add client to client table*/
@@ -130,7 +136,7 @@ int rsm_register(rsm_handle* handle, unsigned int upid, unsigned int tid)
     }
     else
     {
-        LOG_RSMFE(LEVEL_INFO, " rsm_register completed handle = %d \n",*handle);
+        LOG_RSMFE(LEVEL_INFO, " rsm_register completed handle = %x \n",*handle);
         g_vdevrsm->client_list[idx].handle = *handle;
     }
     
@@ -148,13 +154,18 @@ int rsm_acquire(rsm_handle handle, char* job_name, rsm_acquire_rsp_v2 *response)
         LOG_RSMFE(LEVEL_ERR, " rsm_acquire unsuccessful. invalid inputs \n");
         return -EINVAL;
     }
+    if (g_vdevrsm == NULL)
+    {
+        LOG_RSMFE(LEVEL_ERR, "rsm_acquire unsuccessful. No device\n");
+        return -ENODEV;
+    }
     /*find client in client table*/
     idx = find_client_table_entry(handle);
     if(idx >= MAX_CLIENT)
     {
         /* No matching client table entries*/
         err = EBADF;
-        LOG_RSMFE(LEVEL_ERR, " rsm_acquire unsuccessful. invalid FE handle. err = %d \n",err);
+        LOG_RSMFE(LEVEL_ERR, " rsm_acquire unsuccessful. invalid FE handle %x. err = %d \n", handle, err);
         return -err;
     }
 
@@ -163,7 +174,7 @@ int rsm_acquire(rsm_handle handle, char* job_name, rsm_acquire_rsp_v2 *response)
     {
         /* Mem alloc error */
         err = ENOMEM;
-        LOG_RSMFE(LEVEL_ERR, " rsm_acquire unsuccessful. out of memory. err = %d \n",err);
+        LOG_RSMFE(LEVEL_ERR, " rsm_acquire unsuccessful. out of memory. handle %x err = %d \n", handle, err);
         return -err;
     }
     txbuf->cmd = RSM_ACQUIRE;
@@ -175,7 +186,7 @@ int rsm_acquire(rsm_handle handle, char* job_name, rsm_acquire_rsp_v2 *response)
     err = virt_rsm_txbuf(txbuf);
     if(err != NO_ERROR)
     {
-        LOG_RSMFE(LEVEL_ERR, " rsm_acquire unsuccessful. TX Failed: %d \n", err);
+        LOG_RSMFE(LEVEL_ERR, " rsm_acquire unsuccessful. TX Failed. handle %x err = %d \n", handle, err);
         kfree(txbuf);
         return err;
     }
@@ -185,11 +196,11 @@ int rsm_acquire(rsm_handle handle, char* job_name, rsm_acquire_rsp_v2 *response)
 
     if(g_vdevrsm->client_list[idx].rxbuf.return_val.err != 0)
     {
-        LOG_RSMFE(LEVEL_ERR, " rsm_acquire unsuccessful err = %d \n",g_vdevrsm->client_list[idx].rxbuf.return_val.err);
+        LOG_RSMFE(LEVEL_ERR, " rsm_acquire unsuccessful. handle %x err = %d \n", handle, g_vdevrsm->client_list[idx].rxbuf.return_val.err);
     }
     else
     {
-        LOG_RSMFE(LEVEL_INFO, " rsm_acquire completed handle = %d \n",handle);
+        LOG_RSMFE(LEVEL_INFO, " rsm_acquire completed handle = %x \n", handle);
     }
 
     kfree(txbuf);
@@ -201,10 +212,15 @@ int rsm_release_v2(rsm_handle handle, rsm_token token)
     struct virtio_rsm_txbuf *txbuf = NULL;
     int idx = 0;
     int err = NO_ERROR;
-    if (handle == 0)
+    if ((handle == 0) || (token == 0))
     {
         LOG_RSMFE(LEVEL_ERR, " rsm_release unsuccessful. invalid inputs \n");
         return -EINVAL;
+    }
+    if (g_vdevrsm == NULL)
+    {
+        LOG_RSMFE(LEVEL_ERR, "rsm_release unsuccessful. No device\n");
+        return -ENODEV;
     }
     /*find client in client table*/
     idx = find_client_table_entry(handle);
@@ -212,7 +228,7 @@ int rsm_release_v2(rsm_handle handle, rsm_token token)
     {
         /* No matching the client table entries*/
         err = EBADF;
-        LOG_RSMFE(LEVEL_ERR, " rsm_release unsuccessful. invalid FE handle. err = %d \n",err);
+        LOG_RSMFE(LEVEL_ERR, " rsm_release unsuccessful. invalid FE handle %x. err = %d \n", handle, err);
         return -err;
     }
 
@@ -221,7 +237,7 @@ int rsm_release_v2(rsm_handle handle, rsm_token token)
     {
         /* Mem alloc error */
         err = ENOMEM;
-        LOG_RSMFE(LEVEL_ERR, " rsm_release unsuccessful. out of memory. err = %d \n",err);
+        LOG_RSMFE(LEVEL_ERR, " rsm_release unsuccessful. out of memory. handle %x err = %d \n", handle, err);
         return -err;
     }
     txbuf->cmd = RSM_RELEASE;
@@ -233,7 +249,7 @@ int rsm_release_v2(rsm_handle handle, rsm_token token)
     err = virt_rsm_txbuf(txbuf);
     if(err != NO_ERROR)
     {
-        LOG_RSMFE(LEVEL_ERR, " rsm_release unsuccessful. TX Failed: %d \n", err);
+        LOG_RSMFE(LEVEL_ERR, " rsm_release unsuccessful. TX Failed. handle %x err = %d \n", handle, err);
         kfree(txbuf);
         return err;
     }
@@ -242,7 +258,7 @@ int rsm_release_v2(rsm_handle handle, rsm_token token)
     wait_for_completion(&g_vdevrsm->client_list[idx].work);
     if(g_vdevrsm->client_list[idx].rxbuf.return_val.err != 0)
     {
-        LOG_RSMFE(LEVEL_ERR, " rsm_release unsuccessful err = %d \n",g_vdevrsm->client_list[idx].rxbuf.return_val.err);
+        LOG_RSMFE(LEVEL_ERR, " rsm_release unsuccessful. hanele %x err = %d \n", handle, g_vdevrsm->client_list[idx].rxbuf.return_val.err);
     }
     else
     {
@@ -263,6 +279,11 @@ int rsm_unregister_v2(rsm_handle handle)
         LOG_RSMFE(LEVEL_ERR, " rsm_unregister unsuccessful. invalid inputs \n");
         return -EINVAL;
     }
+    if (g_vdevrsm == NULL)
+    {
+        LOG_RSMFE(LEVEL_ERR, "rsm_unregister unsuccessful. No device\n");
+        return -ENODEV;
+    }
 
     /*find client in client table*/
     idx = find_client_table_entry(handle);
@@ -270,7 +291,7 @@ int rsm_unregister_v2(rsm_handle handle)
     {
         /* No matching the client table entries*/
         err = EBADF;
-        LOG_RSMFE(LEVEL_ERR, " rsm_unregister unsuccessful. invalid FE handle. err = %d \n",err);
+        LOG_RSMFE(LEVEL_ERR, " rsm_unregister unsuccessful. invalid FE handle %x. err = %d \n", handle, err);
         return -err;
     }
 
@@ -279,7 +300,7 @@ int rsm_unregister_v2(rsm_handle handle)
     {
         /* Mem alloc error */
         err = ENOMEM;
-        LOG_RSMFE(LEVEL_ERR, " rsm_unregister unsuccessful. out of memory. err = %d \n",err);
+        LOG_RSMFE(LEVEL_ERR, " rsm_unregister unsuccessful. out of memory. handle %x err = %d \n", handle, err);
         return -err;
     }
 
@@ -291,7 +312,7 @@ int rsm_unregister_v2(rsm_handle handle)
     err = virt_rsm_txbuf(txbuf);
     if(err != NO_ERROR)
     {
-        LOG_RSMFE(LEVEL_ERR, " rsm_unregister unsuccessful. TX Failed: %d \n", err);
+        LOG_RSMFE(LEVEL_ERR, " rsm_unregister unsuccessful. TX Failed. handle %x err = %d \n", handle, err);
         kfree(txbuf);
         return err;
     }
@@ -299,12 +320,12 @@ int rsm_unregister_v2(rsm_handle handle)
     wait_for_completion(&g_vdevrsm->client_list[idx].work);
     if(g_vdevrsm->client_list[idx].rxbuf.return_val.err != 0)
     {
-        LOG_RSMFE(LEVEL_ERR, " rsm_unregister unsuccessful err = %d \n",g_vdevrsm->client_list[idx].rxbuf.return_val.err);
+        LOG_RSMFE(LEVEL_ERR, " rsm_unregister unsuccessful. handle %x err = %d \n", handle, g_vdevrsm->client_list[idx].rxbuf.return_val.err);
     }
     else
     {
         delete_client_table_entry(g_vdevrsm->client_list[idx].upid,g_vdevrsm->client_list[idx].tid);
-        LOG_RSMFE(LEVEL_INFO, " rsm_unregister completed handle = %d \n", handle);
+        LOG_RSMFE(LEVEL_INFO, " rsm_unregister completed. handle %x \n", handle);
     }
     
     kfree(txbuf);
