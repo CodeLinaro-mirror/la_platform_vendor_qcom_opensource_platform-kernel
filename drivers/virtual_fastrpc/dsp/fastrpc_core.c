@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: GPL-2.0
-/* Copyright (c) 2011-2018, The Linux Foundation. All rights reserved.
+/* SPDX-License-Identifier: GPL-2.0
+ * Copyright (c) 2011-2018, The Linux Foundation. All rights reserved.
  * Copyright (c) 2018, Linaro Limited
- * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #include <linux/delay.h>
 #include <linux/sort.h>
@@ -583,7 +583,7 @@ static void fastrpc_notif_find_process(int domain,
 	fastrpc_queue_pd_status(user, domain, notif->status, user->sessionid);
 }
 
-static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
+void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
 					u32 rsp_flags, u32 early_wake_time)
 {
 	ctx->retval = retval;
@@ -1615,6 +1615,7 @@ static int fastrpc_invoke_send(struct fastrpc_invoke_ctx *ctx,
 	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_user *fl = ctx->fl;
 	struct fastrpc_msg *msg = &ctx->msg;
+	struct glink_pkt_msg pkt;
 	int ret;
 
 	cctx = fl->cctx;
@@ -1631,7 +1632,17 @@ static int fastrpc_invoke_send(struct fastrpc_invoke_ctx *ctx,
 	msg->addr = ctx->buf ? ctx->buf->da : 0;
 	msg->size = roundup(ctx->msg_sz, PAGE_SIZE);
 
-	ret = fastrpc_transport_send(cctx, (void *)msg, sizeof(*msg));
+	if (cctx->gdriver->has_hybrid == true) {
+		ret = fastrpc_transport_rpmsg_send(cctx, (void *)msg, sizeof(*msg));
+	} else if (cctx->gdriver->has_glink_pkt == true) {
+		pkt.fl= fl;
+		pkt.data = msg;
+		pkt.ctx = ctx;
+		ret = fastrpc_transport_glinkpkt_send(cctx, (void *)&pkt, sizeof(*msg));
+	} else {
+		RPC_ERR("transport layer is not ready\n");
+		ret = -EPIPE;
+	}
 
 	return ret;
 }
@@ -2011,16 +2022,16 @@ static int fastrpc_dspsignal_signal(struct fastrpc_user *fl,
 		/* RSM case */
 		RPC_DBG("rsm_dspsignal_msg sent, target_id %llu, upid %d, signal_id %u",
 						rsm_dspsignal_msg.target_id, fl->upid, fsig->signal_id);
-		err = fastrpc_transport_send(cctx, (void *)&rsm_dspsignal_msg,
+		err = fastrpc_transport_rpmsg_send(cctx, (void *)&rsm_dspsignal_msg,
 						sizeof(hfastrpc_rsm_dspsignal_msg));
 	} else {
 		/* non-RSM case */
 		RPC_DBG("dspsignal msg sent, upid %d, signal_id %u\n",
 						fl->upid, fsig->signal_id);
-		err = fastrpc_transport_send(cctx, (void *)&msg, sizeof(msg));
+		err = fastrpc_transport_rpmsg_send(cctx, (void *)&msg, sizeof(msg));
 	}
 #else
-	err = fastrpc_transport_send(cctx, (void *)&msg, sizeof(msg));
+	err = fastrpc_transport_rpmsg_send(cctx, (void *)&msg, sizeof(msg));
 #endif
 	return err;
 }
@@ -2059,7 +2070,7 @@ static int fastrpc_dspsignal_signal_mc(struct fastrpc_user *fl,
 	/* RSM case */
 	RPC_DBG("rsm_dspsignal_msg sent, target_id %llu, upid %d, signal_id %u",
 					rsm_dspsignal_msg.target_id, fl->upid, fmcsig->signal_id);
-	err = fastrpc_transport_send(cctx, (void *)&rsm_dspsignal_msg,
+	err = fastrpc_transport_rpmsg_send(cctx, (void *)&rsm_dspsignal_msg,
 					sizeof(hfastrpc_rsm_dspsignal_msg));
 
 	return err;
