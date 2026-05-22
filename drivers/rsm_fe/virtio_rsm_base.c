@@ -356,6 +356,7 @@ module_init(virtio_rsm_init);
 module_exit(virtio_rsm_exit);
 
 EXPORT_SYMBOL_GPL(rsm_register);
+EXPORT_SYMBOL_GPL(rsm_register_for_nsp);
 EXPORT_SYMBOL_GPL(rsm_acquire);
 EXPORT_SYMBOL_GPL(rsm_release_v2);
 EXPORT_SYMBOL_GPL(rsm_unregister_v2);
