@@ -192,7 +192,9 @@ register_platform_kernel_module(
         "virtio_fastrpc_core.h",
         "virtio_fastrpc_queue.h",
         "virtio_fastrpc_mem.h",
-        "virtio_fastrpc_trace.h"
+        "virtio_fastrpc_trace.h",
+        "fastrpc_rsm.c",
+        "fastrpc_rsm.h",
     ],
     config_srcs = {
         "CONFIG_COMPAT": {
@@ -202,8 +204,9 @@ register_platform_kernel_module(
             ],
         }
     },
-    deps = [":fastrpc_local_headers"],
+    deps = [":fastrpc_local_headers", ":rsm_fe_headers", "%b_rsm_fe"],
     copts = [
         "-DDSP_TRACE_INCLUDE_PATH=../../../../vendor/qcom/opensource/platform-kernel/drivers/virtual_fastrpc/include/uapi",
+        "-DCONFIG_HYBRID_FASTRPC_RSM=1",
     ],
 )
