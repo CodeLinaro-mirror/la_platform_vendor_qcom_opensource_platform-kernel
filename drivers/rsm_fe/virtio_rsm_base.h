@@ -11,9 +11,8 @@
 #include <linux/debugfs.h>
 #include <linux/string.h>
 #include "virtio_rsm_client.h"
-/* Virtio ID of RSM : 0xC00E */
-#define VIRTIO_ID_RSM   0xC00E
-//#define TEST_MODE     1
+/* Virtio ID of RSM : 0xC010 */
+#define VIRTIO_ID_RSM   0xC010
 
 extern struct virtio_rsm_dev* g_vdevrsm;
 
