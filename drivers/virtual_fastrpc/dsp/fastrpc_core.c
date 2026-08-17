@@ -1,7 +1,7 @@
-// SPDX-License-Identifier: GPL-2.0
-/* Copyright (c) 2011-2018, The Linux Foundation. All rights reserved.
+/* SPDX-License-Identifier: GPL-2.0
+ * Copyright (c) 2011-2018, The Linux Foundation. All rights reserved.
  * Copyright (c) 2018, Linaro Limited
- * Copyright (c) 2022-2025 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 #include <linux/delay.h>
 #include <linux/sort.h>
@@ -583,7 +583,7 @@ static void fastrpc_notif_find_process(int domain,
 	fastrpc_queue_pd_status(user, domain, notif->status, user->sessionid);
 }
 
-static void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
+void fastrpc_notify_user_ctx(struct fastrpc_invoke_ctx *ctx, int retval,
 					u32 rsp_flags, u32 early_wake_time)
 {
 	ctx->retval = retval;
@@ -1108,8 +1108,8 @@ int fastrpc_init_create_process(struct fastrpc_user *fl, char __user *argp)
 	if (err)
 		return err;
 
-	if (fl->cctx->domain->type == FASTRPC_NSP ||
-			fl->cctx->domain->type == FASTRPC_HPASS)
+	if (fl->cctx->domain_type == FASTRPC_NSP ||
+			fl->cctx->domain_type == FASTRPC_HPASS)
 		fastrpc_create_persistent_headers(fl);
 #ifdef CONFIG_DEBUG_FS
 	fastrpc_create_session_debugfs(fl);
@@ -1132,39 +1132,62 @@ static int olaps_cmp(const void *a, const void *b)
 	return st == 0 ? ed : st;
 }
 
-static void fastrpc_get_buff_overlaps(struct fastrpc_invoke_ctx *ctx)
+/**
+ * fastrpc_get_buff_overlaps - Detect and handle buffer overlaps in RPC args
+ * @ctx: The invoke context containing buffer information
+ *
+ * This function detects overlapping memory regions in the RPC arguments and
+ * adjusts the memory mapping accordingly. It handles ION and non-ION buffers
+ * separately to prevent incorrect overlap detection between different buf types.
+ * For each buffer type:
+ * - If a buffer overlaps with a previous buffer of the same type, it adjusts
+ *   the mapping to avoid the overlap
+ * - If no overlap is detected, it uses the full buffer range
+ *
+ * Return: 0 on success, error code on failure
+ */
+static int fastrpc_get_buff_overlaps(struct fastrpc_invoke_ctx *ctx)
 {
-	u64 max_end = 0;
+	u64 ion_buf_end_pos = 0, non_ion_buf_end_pos = 0;
 	int i;
-
+	struct device *dev = ctx->fl->cctx->dev;
 	for (i = 0; i < ctx->nbufs; ++i) {
 		ctx->olaps[i].start = ctx->args[i].ptr;
+		/* Check the overflow for user buffer */
+		if (ctx->olaps[i].start > (ULLONG_MAX - ctx->args[i].length)) {
+			dev_dbg(dev,
+				"user passed invalid non ion buffer addr 0x%llx, size %llx\n",
+				ctx->args[i].ptr, ctx->args[i].length);
+			return -EFAULT;
+		}
 		ctx->olaps[i].end = ctx->olaps[i].start + ctx->args[i].length;
 		ctx->olaps[i].raix = i;
 	}
-
 	sort(ctx->olaps, ctx->nbufs, sizeof(*ctx->olaps), olaps_cmp, NULL);
-
 	for (i = 0; i < ctx->nbufs; ++i) {
-		if (ctx->olaps[i].start < max_end) {
-			ctx->olaps[i].mstart = max_end;
+		/* Separate ION and non-ION buffers; fd <= 0 indicates non-ION */
+		u64 *last_buf_end = (ctx->args[ctx->olaps[i].raix].fd <= 0) ?
+				&non_ion_buf_end_pos : &ion_buf_end_pos;
+		if (ctx->olaps[i].start < *last_buf_end) {
+			/* Overlap detected within same buffer type */
+			ctx->olaps[i].mstart = *last_buf_end;
 			ctx->olaps[i].mend = ctx->olaps[i].end;
-			ctx->olaps[i].offset = max_end - ctx->olaps[i].start;
-
-			if (ctx->olaps[i].end > max_end) {
-				max_end = ctx->olaps[i].end;
+			ctx->olaps[i].offset = *last_buf_end - ctx->olaps[i].start;
+			if (ctx->olaps[i].end > *last_buf_end) {
+				*last_buf_end = ctx->olaps[i].end;
 			} else {
 				ctx->olaps[i].mend = 0;
 				ctx->olaps[i].mstart = 0;
 			}
-
 		} else  {
+			/* No overlap, assign full range */
 			ctx->olaps[i].mend = ctx->olaps[i].end;
 			ctx->olaps[i].mstart = ctx->olaps[i].start;
 			ctx->olaps[i].offset = 0;
-			max_end = ctx->olaps[i].end;
+			*last_buf_end = ctx->olaps[i].end;
 		}
 	}
+	return 0;
 }
 
 static struct fastrpc_invoke_ctx *fastrpc_context_alloc(struct fastrpc_user *fl,
@@ -1615,6 +1638,7 @@ static int fastrpc_invoke_send(struct fastrpc_invoke_ctx *ctx,
 	struct fastrpc_channel_ctx *cctx;
 	struct fastrpc_user *fl = ctx->fl;
 	struct fastrpc_msg *msg = &ctx->msg;
+	struct glink_pkt_msg pkt;
 	int ret;
 
 	cctx = fl->cctx;
@@ -1631,7 +1655,17 @@ static int fastrpc_invoke_send(struct fastrpc_invoke_ctx *ctx,
 	msg->addr = ctx->buf ? ctx->buf->da : 0;
 	msg->size = roundup(ctx->msg_sz, PAGE_SIZE);
 
-	ret = fastrpc_transport_send(cctx, (void *)msg, sizeof(*msg));
+	if (cctx->gdriver->has_hybrid == true) {
+		ret = fastrpc_transport_rpmsg_send(cctx, (void *)msg, sizeof(*msg));
+	} else if (cctx->gdriver->has_glink_pkt == true) {
+		pkt.fl= fl;
+		pkt.data = msg;
+		pkt.ctx = ctx;
+		ret = fastrpc_transport_glinkpkt_send(cctx, (void *)&pkt, sizeof(*msg));
+	} else {
+		RPC_ERR("transport layer is not ready\n");
+		ret = -EPIPE;
+	}
 
 	return ret;
 }
@@ -1817,7 +1851,7 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl, u32 kernel,
 	dma_wmb();
 
 #if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
-	need_rsm = fastrpc_domain_needs_rsm(fl->cctx->domain->id);
+	need_rsm = fastrpc_domain_needs_rsm(fl->cctx->domain_id);
 	/*
 	 * static handles are directly used by fastRPC itself rather than its client,
 	 * and also it will not use those special DSP resource (e.g., VTCM) we need to
@@ -1842,7 +1876,7 @@ static int fastrpc_internal_invoke(struct fastrpc_user *fl, u32 kernel,
 wait:
 	if (fl->poll_mode &&
 		handle > FASTRPC_MAX_STATIC_HANDLE &&
-		fl->cctx->domain->type == FASTRPC_NSP &&
+		fl->cctx->domain_type == FASTRPC_NSP &&
 		fl->pd_type == DYNAMIC_PD)
 		ctx->rsp_flags = POLL_MODE;
 
@@ -1895,7 +1929,7 @@ bail:
 
 #if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
 	if (need_rsm && handle > FASTRPC_MAX_STATIC_HANDLE)
-		fastrpc_rsm_release(fl, current->pid);
+		fastrpc_rsm_release(fl, current->pid, FASTRPC_RSM_SIGNAL_CORE);
 #endif
 	return err;
 }
@@ -1933,6 +1967,19 @@ static int fastrpc_internal_control(struct fastrpc_user *fl,
 	return err;
 }
 
+#if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
+static bool fastrpc_multidomain_needs_rsm(struct fastrpc_mdctx_info *mdctx)
+{
+	bool need_rsm = false;
+	int ii = 0;
+
+	for (ii = 0; ii < mdctx->num_domains; ii++)
+		need_rsm |= fastrpc_domain_needs_rsm(mdctx->domains[ii]);
+
+	return need_rsm;
+}
+#endif
+
 static int fastrpc_dspsignal_signal(struct fastrpc_user *fl,
 					struct fastrpc_internal_dspsignal *fsig)
 {
@@ -1956,7 +2003,7 @@ static int fastrpc_dspsignal_signal(struct fastrpc_user *fl,
 
 	msg = (((uint64_t)fl->upid) << 32) | ((uint64_t)fsig->signal_id);
 #if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
-	need_rsm = fastrpc_domain_needs_rsm(fl->cctx->domain->id);
+	need_rsm = fastrpc_domain_needs_rsm(fl->cctx->domain_id);
 	/**
 	 * @brief Expected Task dispatch & completion workflow via dspqueue and signals for NSP
 	 * shared between GVM and host/PVM through compute resource manager/RSM
@@ -1998,19 +2045,60 @@ static int fastrpc_dspsignal_signal(struct fastrpc_user *fl,
 		/* RSM case */
 		RPC_DBG("rsm_dspsignal_msg sent, target_id %llu, upid %d, signal_id %u",
 						rsm_dspsignal_msg.target_id, fl->upid, fsig->signal_id);
-		err = fastrpc_transport_send(cctx, (void *)&rsm_dspsignal_msg,
+		err = fastrpc_transport_rpmsg_send(cctx, (void *)&rsm_dspsignal_msg,
 						sizeof(hfastrpc_rsm_dspsignal_msg));
 	} else {
 		/* non-RSM case */
 		RPC_DBG("dspsignal msg sent, upid %d, signal_id %u\n",
 						fl->upid, fsig->signal_id);
-		err = fastrpc_transport_send(cctx, (void *)&msg, sizeof(msg));
+		err = fastrpc_transport_rpmsg_send(cctx, (void *)&msg, sizeof(msg));
 	}
 #else
-	err = fastrpc_transport_send(cctx, (void *)&msg, sizeof(msg));
+	err = fastrpc_transport_rpmsg_send(cctx, (void *)&msg, sizeof(msg));
 #endif
 	return err;
 }
+
+#if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
+static int fastrpc_dspsignal_signal_mc(struct fastrpc_user *fl,
+					struct fastrpc_internal_dspsignal_mc *fmcsig)
+{
+	int err = 0;
+	struct fastrpc_channel_ctx *cctx = NULL;
+	u64 msg = 0;
+	u32 signal_id = fmcsig->signal_id;
+	unsigned int target_id = fmcsig->ctx;
+	hfastrpc_rsm_dspsignal_msg rsm_dspsignal_msg;
+
+	DSPSIGNAL_VERBOSE("send signal PID %u, unique fastrpc pid %u signal %u\n",
+			fl->tgid, fl->upid, signal_id);
+	cctx = fl->cctx;
+	if (!(signal_id < FASTRPC_DSPSIGNAL_NUM_SIGNALS)) {
+		RPC_ERR("sending bad signal %u for PID %u",
+				signal_id, fl->tgid);
+		return -EINVAL;
+	}
+
+	msg = (((uint64_t)fl->upid) << 32) | ((uint64_t)fmcsig->signal_id);
+	if (GET_SIGNAL_NO(signal_id) != DSPQUEUE_SIGNAL_REQ_PACKET) {
+		RPC_ERR("unexpected signal %u to be sent to this dsp shared through compute resource manager for PID %u",
+			GET_SIGNAL_NO(signal_id), fl->tgid);
+		return -EINVAL;
+	}
+	err = fastrpc_multidomain_rsm_acquire(fl, target_id);
+	if (err)
+		return err;
+	rsm_dspsignal_msg.legacy_msg = msg;
+	rsm_dspsignal_msg.target_id = target_id;
+	/* RSM case */
+	RPC_DBG("rsm_dspsignal_msg sent, target_id %llu, upid %d, signal_id %u",
+					rsm_dspsignal_msg.target_id, fl->upid, fmcsig->signal_id);
+	err = fastrpc_transport_rpmsg_send(cctx, (void *)&rsm_dspsignal_msg,
+					sizeof(hfastrpc_rsm_dspsignal_msg));
+
+	return err;
+}
+#endif
 
 static int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 					struct fastrpc_internal_dspsignal *fsig)
@@ -2025,6 +2113,104 @@ static int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 #if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
 	bool need_rsm = false;
 #endif
+
+	DSPSIGNAL_VERBOSE("wait for signal %u\n", signal_id);
+	if (!(signal_id < FASTRPC_DSPSIGNAL_NUM_SIGNALS)) {
+		RPC_ERR("waiting on bad signal %u\n", signal_id);
+		return -EINVAL;
+	}
+
+	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
+	if (fl->signal_groups[signal_id / FASTRPC_DSPSIGNAL_GROUP_SIZE] != NULL) {
+		struct fastrpc_dspsignal *group =
+			fl->signal_groups[signal_id / FASTRPC_DSPSIGNAL_GROUP_SIZE];
+
+		s = &group[signal_id % FASTRPC_DSPSIGNAL_GROUP_SIZE];
+	}
+	if ((s == NULL) || (s->state == DSPSIGNAL_STATE_UNUSED)) {
+		spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
+		RPC_ERR("unknown signal id %u\n", signal_id);
+		return -ENOENT;
+	}
+	if (s->state != DSPSIGNAL_STATE_PENDING) {
+		if ((s->state == DSPSIGNAL_STATE_CANCELED) ||
+				(s->state == DSPSIGNAL_STATE_UNUSED))
+			err = -EINTR;
+		if (s->state == DSPSIGNAL_STATE_SIGNALED) {
+			/* Signal already received from DSP. Reset signal state and return */
+			s->state = DSPSIGNAL_STATE_PENDING;
+			reinit_completion(&s->comp);
+		}
+
+		spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
+		DSPSIGNAL_VERBOSE("signal %u in state %u, complete wait immediately",
+				signal_id, s->state);
+		return err;
+	}
+	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
+	if (timeout_usec != 0xffffffff)
+		ret = wait_for_completion_interruptible_timeout(&s->comp, timeout);
+	else
+		ret = wait_for_completion_interruptible(&s->comp);
+
+	if (timeout_usec != 0xffffffff && ret == 0) {
+		DSPSIGNAL_VERBOSE("wait for signal %u timed out\n", signal_id);
+		return -ETIMEDOUT;
+	} else if (ret < 0) {
+		RPC_ERR("wait for signal %u failed %d\n", signal_id, (int)ret);
+		return ret;
+	}
+
+	spin_lock_irqsave(&fl->dspsignals_lock, irq_flags);
+	if (s->state == DSPSIGNAL_STATE_SIGNALED) {
+		s->state = DSPSIGNAL_STATE_PENDING;
+		DSPSIGNAL_VERBOSE("signal %u completed\n", signal_id);
+	} else if ((s->state == DSPSIGNAL_STATE_CANCELED) ||
+			(s->state == DSPSIGNAL_STATE_UNUSED)) {
+		DSPSIGNAL_VERBOSE("signal %u cancelled or destroyed\n", signal_id);
+		err = -EINTR;
+	}
+	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
+#if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
+	need_rsm = fastrpc_domain_needs_rsm(fl->cctx->domain_id);
+	/* refer to above workflow */
+	if (need_rsm) {
+		/*
+		 * Only recieving DSPQUEUE_SIGNAL_RESP_PACKET requires calling
+		 * compressched_release(). No other signals should be sent in
+		 * this scenario (e.g., DSPQUEUE_SIGNAL_REQ_SPACE).
+		 * DSPQUEUE_SIGNAL_REQ_SPACE is used only when HLOS previously
+		 * ran out of space due to continuous writes and HLOS is blocked
+		 * by waiting for DSPQUEUE_SIGNAL_REQ_SPACE; after DSP reads and
+		 * frees space, DSP would send DSPQUEUE_SIGNAL_REQ_SPACE to unblock
+		 * HLOS from above waiting and continue writing. This flow is not
+		 * valid for NSP shared between GVM and host/PVM through compute
+		 * resource manager/RSM.
+		 */
+		if(GET_SIGNAL_NO(signal_id) != DSPQUEUE_SIGNAL_RESP_PACKET) {
+			RPC_ERR("unexpected signal %u received from this dsp shared through compute resource manager for PID %u",
+				GET_SIGNAL_NO(signal_id), fl->tgid);
+			return -EINVAL;
+		}
+		fastrpc_rsm_release(fl, fl->upid, FASTRPC_RSM_SIGNAL_CORE);
+	}
+#endif
+	return err;
+}
+
+#if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
+static int fastrpc_dspsignal_wait_mc(struct fastrpc_user *fl,
+					struct fastrpc_internal_dspsignal_mc *fmcsig)
+{
+	int err = 0;
+	uint32_t timeout_usec = fmcsig->timeout_usec;
+	unsigned long timeout = usecs_to_jiffies(fmcsig->timeout_usec);
+	u32 signal_id = fmcsig->signal_id;
+	struct fastrpc_dspsignal *s = NULL;
+	long ret = 0;
+	unsigned long irq_flags = 0;
+	unsigned int target_id = fmcsig->ctx;
+
 
 	DSPSIGNAL_VERBOSE("wait for signal %u\n", signal_id);
 	if (!(signal_id < FASTRPC_DSPSIGNAL_NUM_SIGNALS)) {
@@ -2077,32 +2263,16 @@ static int fastrpc_dspsignal_wait(struct fastrpc_user *fl,
 		err = -EINTR;
 	}
 	spin_unlock_irqrestore(&fl->dspsignals_lock, irq_flags);
-#if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
-	need_rsm = fastrpc_domain_needs_rsm(fl->cctx->domain->id);
-	/* refer to above workflow */
-	if (need_rsm) {
-		/*
-		 * Only recieving DSPQUEUE_SIGNAL_RESP_PACKET requires calling
-		 * compressched_release(). No other signals should be sent in
-		 * this scenario (e.g., DSPQUEUE_SIGNAL_REQ_SPACE).
-		 * DSPQUEUE_SIGNAL_REQ_SPACE is used only when HLOS previously
-		 * ran out of space due to continuous writes and HLOS is blocked
-		 * by waiting for DSPQUEUE_SIGNAL_REQ_SPACE; after DSP reads and
-		 * frees space, DSP would send DSPQUEUE_SIGNAL_REQ_SPACE to unblock
-		 * HLOS from above waiting and continue writing. This flow is not
-		 * valid for NSP shared between GVM and host/PVM through compute
-		 * resource manager/RSM.
-		 */
-		if(GET_SIGNAL_NO(signal_id) != DSPQUEUE_SIGNAL_RESP_PACKET) {
-			RPC_ERR("unexpected signal %u received from this dsp shared through compute resource manager for PID %u",
-				GET_SIGNAL_NO(signal_id), fl->tgid);
-			return -EINVAL;
-		}
-		fastrpc_rsm_release(fl, fl->upid);
+	if(GET_SIGNAL_NO(signal_id) != DSPQUEUE_SIGNAL_RESP_PACKET) {
+		RPC_ERR("unexpected signal %u received from this dsp shared through compute resource manager for PID %u",
+			GET_SIGNAL_NO(signal_id), fl->tgid);
+		return -EINVAL;
 	}
-#endif
+	fastrpc_multidomain_rsm_release(fl, target_id);
+
 	return err;
 }
+#endif
 
 static int fastrpc_dspsignal_create(struct fastrpc_user *fl,
 					struct fastrpc_internal_dspsignal *fsig)
@@ -2291,6 +2461,48 @@ static int fastrpc_invoke_dspsignal(struct fastrpc_user *fl,
 	return err;
 }
 
+#if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
+static int fastrpc_invoke_dspsignal_mc(struct fastrpc_user *fl,
+					struct fastrpc_internal_dspsignal_mc *fmcsig)
+{
+	int err = 0;
+	bool need_rsm = false;
+	struct fastrpc_internal_dspsignal *fsig = NULL;
+	unsigned int ctx;
+
+	fsig = kzalloc(sizeof(*fsig), GFP_KERNEL);
+	if (!fsig)
+		return -ENOMEM;
+
+	fsig->req = fmcsig->req;
+	fsig->signal_id = fmcsig->signal_id;
+	fsig->flags = fmcsig->flags;
+	fsig->timeout_usec = fmcsig->timeout_usec;
+	ctx = fmcsig->ctx;
+	need_rsm = fastrpc_multidomain_ctx_needs_rsm(fl, ctx);
+
+	switch(fmcsig->req) {
+
+	case FASTRPC_DSPSIGNAL_SIGNAL_MC:
+		if (need_rsm)
+			err = fastrpc_dspsignal_signal_mc(fl, fmcsig);
+		else
+			err = fastrpc_dspsignal_signal(fl, fsig);
+
+		break;
+	case FASTRPC_DSPSIGNAL_WAIT_MC :
+		if (need_rsm)
+			err = fastrpc_dspsignal_wait_mc(fl, fmcsig);
+		else
+			err = fastrpc_dspsignal_wait(fl, fsig);
+		break;
+	}
+
+	kfree(fsig);
+	return err;
+}
+#endif
+
 void fastrpc_notify_users(struct fastrpc_user *user)
 {
 	struct fastrpc_invoke_ctx *ctx;
@@ -2410,8 +2622,8 @@ static int fastrpc_set_session_info(struct fastrpc_user *fl,
 }
 
 /* Get fastrpc cid of given session on given domain */
-static int fastrpc_get_frpc_cid(uint32_t domain, uint32_t session,
-	int32_t *cid)
+static int fastrpc_get_frpc_cid_upid_fl(uint32_t domain, uint32_t session,
+	int32_t *cid, uint32_t *upid, struct fastrpc_user **fl)
 {
 	int err = 0;
 	bool found = false;
@@ -2440,6 +2652,8 @@ static int fastrpc_get_frpc_cid(uint32_t domain, uint32_t session,
 	list_for_each_entry(user, &cctx->users, user) {
 		if (user->tgid == current->tgid && user->sessionid == session) {
 			*cid = user->cid;
+			*upid = user->upid;
+			*fl = user;
 			found = true;
 			break;
 		}
@@ -2465,8 +2679,8 @@ bail:
 	return err;
 }
 
-/* Helper function to get frpc tgid of each session of context */
-static int fastrpc_multidomain_ctx_get_cids(struct device *dev,
+/* Helper function to get frpc tgid, upids and fls of each session of context */
+static int fastrpc_multidomain_ctx_get_cids_upids_fls(struct device *dev,
 	struct fastrpc_mdctx_info *mdctx)
 {
 	int err = 0, ii = 0;
@@ -2508,10 +2722,10 @@ static int fastrpc_multidomain_ctx_get_cids(struct device *dev,
 			break;
 		}
 
-		err = fastrpc_get_frpc_cid(logical_domain_id, session,
-					&mdctx->cids[ii]);
+		err = fastrpc_get_frpc_cid_upid_fl(logical_domain_id, session,
+					&mdctx->cids[ii], &mdctx->upids[ii], &mdctx->fls[ii]);
 		if (err) {
-			dev_err(dev, "Error %d: %s: [%d of %d]: unable to get frpc tgid for domain %u, session %u",
+			dev_err(dev, "Error %d: %s: [%d of %d]: unable to get frpc tgid, upid, fl for domain %u, session %u",
 							err, __func__, ii, num_domains, logical_domain_id, session);
 			break;
 		}
@@ -2530,8 +2744,9 @@ static int fastrpc_multidomain_ctx_obj_init(struct fastrpc_user *fl,
 						FASTRPC_MAX_SESSIONS_PER_PROCESS;
 	struct device *dev = fl->cctx->dev;
 	size_t size = 0;
-	uint32_t *domains = NULL, *session_ids = NULL;
+	uint32_t *domains = NULL, *session_ids = NULL, *upids = NULL;
 	int32_t *cid = NULL;
+	struct fastrpc_user **fls = NULL;
 	struct fastrpc_mdctx_info *mdctx = NULL;
 
 	/* Validate that reserved fields are all zero */
@@ -2609,19 +2824,42 @@ static int fastrpc_multidomain_ctx_obj_init(struct fastrpc_user *fl,
 			err, __func__, size);
 		goto bail;
 	}
+
+	size = sizeof(*upids) * num_domains;
+	upids = kzalloc(size, GFP_KERNEL);
+	if (!upids) {
+		err = -ENOMEM;
+		dev_err(dev, "Error %d: %s: failed to alloc pids array of size %zu",
+			err, __func__, size);
+		goto bail;
+	}
+
+	size = sizeof(*fls) * num_domains;
+	fls = kzalloc(size, GFP_KERNEL);
+	if (!fls) {
+		err = -ENOMEM;
+		dev_err(dev, "Error %d: %s: failed to alloc fls array of size %zu",
+			err, __func__, size);
+		goto bail;
+	}
+
 	mdctx->num_domains = num_domains;
 	mdctx->domains = domains;
 	mdctx->session_ids = session_ids;
 	mdctx->cids = cid;
+	mdctx->upids = upids;
+	mdctx->fls = fls;
 	INIT_LIST_HEAD(&mdctx->node);
 
-	err = fastrpc_multidomain_ctx_get_cids(dev, mdctx);
+	err = fastrpc_multidomain_ctx_get_cids_upids_fls(dev, mdctx);
 	if (err)
 		goto bail;
 
 	*o_mdctx = mdctx;
 bail:
 	if (err) {
+		kfree(fls);
+		kfree(upids);
 		kfree(cid);
 		kfree(session_ids);
 		kfree(domains);
@@ -2706,7 +2944,9 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 	struct mutex *gmut = &gdriver->gmut;
 	struct device *dev = fl->cctx->dev;
 	struct fastrpc_mdctx_info *mdctx = NULL;
-
+#if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
+	bool need_rsm = false;
+#endif
 	err = fastrpc_multidomain_ctx_obj_init(fl, ctxm, &mdctx);
 	if (err)
 		return err;
@@ -2729,6 +2969,14 @@ static int fastrpc_multidomain_ctx_setup(struct fastrpc_user *fl,
 	mdctx->ctx = ctx;
 	mdctx->fl = fl;
 
+#if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
+	need_rsm = fastrpc_multidomain_needs_rsm(mdctx);
+	if (need_rsm) {
+		err = fastrpc_multidomain_rsm_register(fl, mdctx);
+		if (err)
+			goto bail;
+	}
+#endif
 	/* Add node to user's multidomain context list */
 	spin_lock(&fl->lock);
 	list_add_tail(&mdctx->node, &fl->mdctxs);
@@ -2896,6 +3144,9 @@ int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 	struct fastrpc_ioctl_multimode_invoke invoke;
 	struct fastrpc_internal_control cp = {0};
 	struct fastrpc_internal_dspsignal *fsig = NULL;
+#if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
+	struct fastrpc_internal_dspsignal_mc *fmcsig = NULL;
+#endif
 	struct fastrpc_internal_notif_rsp notif;
 	struct fastrpc_internal_sessinfo sessinfo;
 	struct fastrpc_ioctl_mdctx_manage ctxm = {0};
@@ -2941,6 +3192,23 @@ int fastrpc_multimode_invoke(struct fastrpc_user *fl, char __user *argp)
 		err = fastrpc_invoke_dspsignal(fl, fsig);
 		kfree(fsig);
 		break;
+#if IS_ENABLED(CONFIG_HYBRID_FASTRPC_RSM)
+	case FASTRPC_INVOKE_DSPSIGNAL_MC:
+		if (invoke.size > sizeof(*fmcsig))
+			return -EINVAL;
+		fmcsig = kzalloc(sizeof(*fmcsig), GFP_KERNEL);
+		if (!fmcsig)
+			return -ENOMEM;
+		if (copy_from_user(fmcsig,
+				(void __user *)(uintptr_t)invoke.invparam,
+				invoke.size)) {
+			kfree(fmcsig);
+			return -EFAULT;
+		}
+		err = fastrpc_invoke_dspsignal_mc(fl, fmcsig);
+		kfree(fmcsig);
+		break;
+#endif
 	case FASTRPC_INVOKE_NOTIF:
 		if (invoke.dynamic_domains)
 			legacy_domains = false;

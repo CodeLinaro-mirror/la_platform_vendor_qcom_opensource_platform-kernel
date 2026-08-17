@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only
  *
- * Copyright (c) 2023-2025, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
  */
 
 #ifndef __FASTRPC_COMMON_H__
@@ -55,6 +55,7 @@
 #define VIRTIO_FASTRPC_CMD_SMMU_MAP		11
 #define VIRTIO_FASTRPC_CMD_SMMU_UNMAP		12
 #define VIRTIO_FASTRPC_CMD_MDCTX_MANAGE		13
+#define VIRTIO_FASTRPC_CMD_SEND_GLINK_PKT	14
 
 #define FASTRPC_CPUINFO_DEFAULT		0
 #define FASTRPC_CPUINFO_EARLY_WAKEUP	1
@@ -186,6 +187,12 @@ enum fastrpc_dspsignal_state {
 	DSPSIGNAL_STATE_CANCELED,
 };
 
+enum fastrpc_rsm_node_type {
+    FASTRPC_RSM_SIGNAL_CORE = 0,
+    FASTRPC_RSM_MULTI_CORE,
+    FASTRPC_RSM_TYPE_NUM
+};
+
 struct fastrpc_internal_dspsignal {
 	u32 req;
 	u32 signal_id;
@@ -193,6 +200,16 @@ struct fastrpc_internal_dspsignal {
 		u32 flags;
 		u32 timeout_usec;
 	};
+};
+
+struct fastrpc_internal_dspsignal_mc {
+	u32 req;
+	u32 signal_id;
+	union {
+		u32 flags;
+		u32 timeout_usec;
+	};
+	u64 ctx;
 };
 
 struct fastrpc_dspsignal {
@@ -313,9 +330,24 @@ struct fastrpc_invoke_ctx {
 
 struct fastrpc_domain;
 
+/*
+ * struct fastrpc_channel_ctx - Per-rpmsg-channel state.
+ *
+ * Allocated by fastrpc_rpmsg_probe() (kzalloc) with @refcount
+ * initialised to 1 for the rpmsg driver. Each fastrpc_user takes
+ * an extra ref via fastrpc_channel_ctx_get() at open and drops it
+ * via fastrpc_channel_ctx_put() at release; fastrpc_rpmsg_remove()
+ * drops the rpmsg driver's ref. Freed by fastrpc_channel_ctx_free()
+ * (the kref release callback) when the last ref goes away.
+ */
 struct fastrpc_channel_ctx {
 	struct fastrpc_common *gdriver;
 	int domain_id;
+	/* Cached domain->type, populated together with domain_id at bind
+	 * time. Lets readers access the DSP type via fl->cctx directly
+	 * so cctx->domain can be torn down at SSR without racing them.
+	 */
+	enum fastrpc_dsp_type domain_type;
 /* Structure holding info on domain associated with channel */
 	struct fastrpc_domain *domain;
 	struct rpmsg_device *rpdev;
@@ -346,6 +378,18 @@ struct fastrpc_channel_ctx {
 	atomic_t invoke_cnt;
 };
 
+/*
+ * struct fastrpc_domain - Description of a DSP domain. No refcount.
+ *
+ * Non-discovery mode:
+ *   Allocated in fastrpc_rpmsg_probe() (kzalloc) and owned by the
+ *   bound cctx. Freed by fastrpc_rpmsg_remove().
+ *
+ * Discovery mode (is_device_discovery_supported() == true):
+ *   Populated from device-tree into a global hash-table keyed by
+ *   @phy_id; survives across SSR / rpmsg_remove / rpmsg_probe.
+ *   fastrpc_rpmsg_remove() only clears the @cctx back-pointer.
+ */
 struct fastrpc_domain {
 	/* Node for adding to global domains hash-table */
 	struct hlist_node node;
@@ -473,6 +517,10 @@ struct fastrpc_mdctx_info {
 	uint32_t num_domains;
 	/* User-obj using which context was created */
 	struct fastrpc_user *fl;
+	/* User-objs of all domains in this multi-domain */
+	struct fastrpc_user **fls;
+	/* List of upids on each domain */
+	uint32_t *upids;
 	/* Kernel generated context id */
 	uint64_t ctx;
 };
@@ -505,11 +553,16 @@ struct virt_fastrpc_sgtable {
 	struct virt_fastrpc_sgl sgl[0];
 } __packed;
 
-
 struct virt_cap_msg {
 	struct virt_msg_hdr hdr;	/* virtio fastrpc message header */
 	u32 domain;		/* DSP domain id */
 	u32 dsp_caps[FASTRPC_MAX_DSP_ATTRIBUTES];	/* DSP capability */
+} __packed;
+
+struct virt_glink_pkt_msg {
+	struct virt_msg_hdr hdr;
+	u64 seq_num;
+	char data[0];
 } __packed;
 
 struct virt_fastrpc_vq {
@@ -522,6 +575,9 @@ struct virt_fastrpc_vq {
 struct vfastrpc_rsm_entry {
 	struct hlist_node hn;
 	struct kref refcount;
+	atomic_t dspqueue_req_cnt;
+	atomic_t dspqueue_rsp_cnt;
+	enum fastrpc_rsm_node_type type;
 	/*
 	 * thread id or unique fastrpc pid (upid)
 	 * In normal invoke case, it will be thread id (gotten
@@ -549,6 +605,12 @@ struct vfastrpc_rsm_entry {
 };
 #endif
 
+struct glink_pkt_msg {
+	struct fastrpc_user *fl;
+	void *data;
+	struct fastrpc_invoke_ctx *ctx;
+};
+
 /* Struct to hold globally used variables */
 struct fastrpc_common {
 	struct virtio_device *vdev;
@@ -562,6 +624,8 @@ struct fastrpc_common {
 	unsigned int buf_size;
 	unsigned int num_channels;
 	int last_sbuf;
+	bool has_hybrid;
+	bool has_glink_pkt;
 
 	spinlock_t msglock;
 	struct virt_fastrpc_msg *msgtable[FASTRPC_MSG_MAX];
@@ -613,13 +677,16 @@ static const char *fastrpc_dsp_type_labels[FASTRPC_MAX_DSP_TYPE] =
 	"hpass"
 };
 
-int fastrpc_transport_send(struct fastrpc_channel_ctx *cctx,
+int fastrpc_transport_rpmsg_send(struct fastrpc_channel_ctx *cctx,
 		void *rpc_msg, uint32_t rpc_msg_size);
-int fastrpc_transport_init(void);
-void fastrpc_transport_deinit(void);
+int fastrpc_transport_glinkpkt_send(struct fastrpc_channel_ctx *cctx,
+		void *rpc_msg, uint32_t rpc_msg_size);
+int fastrpc_transport_rpmsg_init(void);
+int fastrpc_transport_glinkpkt_init(void);
+void fastrpc_transport_rpmsg_deinit(void);
+void fastrpc_transport_glinkpkt_deinit(void);
 int fastrpc_handle_rpc_response(struct fastrpc_channel_ctx *cctx,
 		void *data, int len);
-struct fastrpc_channel_ctx* get_current_channel_ctx(struct device *dev);
 void fastrpc_update_gdriver(struct fastrpc_channel_ctx *cctx, int flag);
 void fastrpc_notify_users(struct fastrpc_user *user);
 long fastrpc_device_ioctl(struct file *file, unsigned int cmd,
