@@ -321,10 +321,14 @@ int place_marker(const char *name)
 {
 
 #if IS_ENABLED(CONFIG_HIBERNATION)
-        if (!strcmp(name, "M - Image Kernel Start")) {
-                boot_marker_cleanup();
-                set_bootloader_stats(true);
-        }
+	if (IS_ENABLED(CONFIG_QTI_QUIN_GVM)) {
+		if (!strcmp(name, "M - Hibernation: Image restore start")) {
+			boot_marker_cleanup();
+		}
+	} else if (!strcmp(name, "M - Hibernation: Image restore start")) {
+		boot_marker_cleanup();
+		set_bootloader_stats(true);
+	}
 #endif /* CONFIG_HIBERNATION */
 
         _create_boot_marker((char *)name, msm_timer_get_sclk_ticks_kernel());
