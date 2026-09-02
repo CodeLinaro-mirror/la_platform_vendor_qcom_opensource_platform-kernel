@@ -457,6 +457,16 @@ void fastrpc_free_user(struct fastrpc_user *fl)
 
 	fastrpc_buf_list_free(fl, &fl->mmaps, false);
 
+	if (fl->pers_hdr_buf) {
+		fastrpc_buf_free(fl->pers_hdr_buf, false);
+		fl->pers_hdr_buf = NULL;
+	}
+
+        if (fl->hdr_bufs) {
+		kfree(fl->hdr_bufs);
+		fl->hdr_bufs = NULL;
+	}
+
 	fastrpc_buf_list_free(fl, &fl->cached_bufs, true);
 
 	/* Iterate thru all multidomain contexts of user and destroy each one */
